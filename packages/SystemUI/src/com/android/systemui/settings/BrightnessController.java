@@ -51,6 +51,8 @@ import java.util.ArrayList;
 
 public class BrightnessController implements ToggleSlider.Listener {
     private static final String TAG = "StatusBar.BrightnessController";
+    private static final boolean SHOW_AUTOMATIC_ICON = false;
+
     private static final int SLIDER_ANIMATION_DURATION = 3000;
 
     private static final int MSG_UPDATE_ICON = 0;
@@ -62,10 +64,8 @@ public class BrightnessController implements ToggleSlider.Listener {
 
     private final int mMinimumBacklight;
     private final int mMaximumBacklight;
-    private final int mDefaultBacklight;
     private final int mMinimumBacklightForVr;
     private final int mMaximumBacklightForVr;
-    private final int mDefaultBacklightForVr;
 
     private final Context mContext;
     private final ImageView mIcon;
@@ -207,18 +207,21 @@ public class BrightnessController implements ToggleSlider.Listener {
     private final Runnable mUpdateSliderRunnable = new Runnable() {
         @Override
         public void run() {
-            final int val;
-            final boolean inVrMode = mIsVrModeEnabled;
-            if (inVrMode) {
-                val = Settings.System.getIntForUser(mContext.getContentResolver(),
-                        Settings.System.SCREEN_BRIGHTNESS_FOR_VR, mDefaultBacklightForVr,
+            if (mIsVrModeEnabled) {
+                int value = Settings.System.getIntForUser(mContext.getContentResolver(),
+                        Settings.System.SCREEN_BRIGHTNESS_FOR_VR, mMaximumBacklight,
                         UserHandle.USER_CURRENT);
+                mHandler.obtainMessage(MSG_UPDATE_SLIDER,
+                        mMaximumBacklightForVr - mMinimumBacklightForVr,
+                        value - mMinimumBacklightForVr).sendToTarget();
             } else {
-                val = Settings.System.getIntForUser(mContext.getContentResolver(),
-                        Settings.System.SCREEN_BRIGHTNESS, mDefaultBacklight,
+                int value;
+                value = Settings.System.getIntForUser(mContext.getContentResolver(),
+                        Settings.System.SCREEN_BRIGHTNESS, mMaximumBacklight,
                         UserHandle.USER_CURRENT);
+                mHandler.obtainMessage(MSG_UPDATE_SLIDER, mMaximumBacklight - mMinimumBacklight,
+                        value - mMinimumBacklight).sendToTarget();
             }
-            mHandler.obtainMessage(MSG_UPDATE_SLIDER, val, inVrMode ? 1 : 0).sendToTarget();
         }
     };
 
@@ -240,7 +243,8 @@ public class BrightnessController implements ToggleSlider.Listener {
                         updateIcon(msg.arg1 != 0);
                         break;
                     case MSG_UPDATE_SLIDER:
-                        updateSlider(msg.arg1, msg.arg2 != 0);
+                        mControl.setMax(msg.arg1);
+                        animateSliderTo(msg.arg2);
                         break;
                     case MSG_SET_CHECKED:
                         mControl.setChecked(msg.arg1 != 0);
@@ -278,13 +282,11 @@ public class BrightnessController implements ToggleSlider.Listener {
         };
         mBrightnessObserver = new BrightnessObserver(mHandler);
 
-        PowerManager pm = context.getSystemService(PowerManager.class);
+        PowerManager pm = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
         mMinimumBacklight = pm.getMinimumScreenBrightnessSetting();
         mMaximumBacklight = pm.getMaximumScreenBrightnessSetting();
-        mDefaultBacklight = pm.getDefaultScreenBrightnessSetting();
         mMinimumBacklightForVr = pm.getMinimumScreenBrightnessForVrSetting();
         mMaximumBacklightForVr = pm.getMaximumScreenBrightnessForVrSetting();
-        mDefaultBacklightForVr = pm.getDefaultScreenBrightnessForVrSetting();
 
         mAutomaticAvailable = context.getResources().getBoolean(
                 com.android.internal.R.bool.config_automatic_brightness_available);
@@ -364,39 +366,38 @@ public class BrightnessController implements ToggleSlider.Listener {
             mSliderAnimator.cancel();
         }
 
-        final int min;
-        final int max;
-        final int metric;
-        final String setting;
-
         if (mIsVrModeEnabled) {
-            metric = MetricsEvent.ACTION_BRIGHTNESS_FOR_VR;
-            min = mMinimumBacklightForVr;
-            max = mMaximumBacklightForVr;
-            setting = Settings.System.SCREEN_BRIGHTNESS_FOR_VR;
+            final int val = value + mMinimumBacklightForVr;
+            if (stopTracking) {
+                MetricsLogger.action(mContext, MetricsEvent.ACTION_BRIGHTNESS_FOR_VR, val);
+            }
+            setBrightness(val);
+            if (!tracking) {
+                AsyncTask.execute(new Runnable() {
+                        public void run() {
+                            Settings.System.putIntForUser(mContext.getContentResolver(),
+                                    Settings.System.SCREEN_BRIGHTNESS_FOR_VR, val,
+                                    UserHandle.USER_CURRENT);
+                        }
+                    });
+            }
         } else {
-            metric = mAutomatic
-                    ? MetricsEvent.ACTION_BRIGHTNESS_AUTO
-                    : MetricsEvent.ACTION_BRIGHTNESS;
-            min = mMinimumBacklight;
-            max = mMaximumBacklight;
-            setting = Settings.System.SCREEN_BRIGHTNESS;
-        }
-
-        final int val = convertGammaToLinear(value, min, max);
-
-        if (stopTracking) {
-            MetricsLogger.action(mContext, metric, val);
-        }
-
-        setBrightness(val);
-        if (!tracking) {
-            AsyncTask.execute(new Runnable() {
-                    public void run() {
-                        Settings.System.putIntForUser(mContext.getContentResolver(),
-                                setting, val, UserHandle.USER_CURRENT);
-                    }
-                });
+            final int val = value + mMinimumBacklight;
+            if (stopTracking) {
+                final int metric = mAutomatic ?
+                        MetricsEvent.ACTION_BRIGHTNESS_AUTO : MetricsEvent.ACTION_BRIGHTNESS;
+                MetricsLogger.action(mContext, metric, val);
+            }
+            setBrightness(val);
+            if (!tracking) {
+                AsyncTask.execute(new Runnable() {
+                        public void run() {
+                            Settings.System.putIntForUser(mContext.getContentResolver(),
+                                    Settings.System.SCREEN_BRIGHTNESS, val,
+                                    UserHandle.USER_CURRENT);
+                        }
+                    });
+            }
         }
 
         for (BrightnessStateChangeCallback cb : mChangeCallbacks) {
@@ -441,28 +442,6 @@ public class BrightnessController implements ToggleSlider.Listener {
         }
     }
 
-    private void updateSlider(int val, boolean inVrMode) {
-        final int min;
-        final int max;
-        if (inVrMode) {
-            min = mMinimumBacklightForVr;
-            max = mMaximumBacklightForVr;
-        } else {
-            min = mMinimumBacklight;
-            max = mMaximumBacklight;
-        }
-        if (val == convertGammaToLinear(mControl.getValue(), min, max)) {
-            // If we have more resolution on the slider than we do in the actual setting, then
-            // multiple slider positions will map to the same setting value. Thus, if we see a
-            // setting value here that maps to the current slider position, we don't bother to
-            // calculate the new slider position since it may differ and look like a brightness
-            // change to the user even though it isn't one.
-            return;
-        }
-        final int sliderVal = convertLinearToGamma(val, min, max);
-        animateSliderTo(sliderVal);
-    }
-
     private void animateSliderTo(int target) {
         if (!mControlValueInitialized) {
             // Don't animate the first value since its default state isn't meaningful to users.
@@ -483,5 +462,4 @@ public class BrightnessController implements ToggleSlider.Listener {
         mSliderAnimator.setDuration(animationDuration);
         mSliderAnimator.start();
     }
-
 }
